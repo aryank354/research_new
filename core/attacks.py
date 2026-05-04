@@ -46,3 +46,17 @@ class Attacks:
         tampered[pepper] = 0
         gt_mask[salt | pepper] = True
         return tampered, gt_mask
+    
+
+    @staticmethod
+    def jpeg_compression(img, quality=80):
+        """Simulates a global JPEG compression attack."""
+        # Encode to JPEG in memory, then decode back to raw pixels
+        encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), quality]
+        _, encimg = cv2.imencode('.jpg', img, encode_param)
+        tampered = cv2.imdecode(encimg, cv2.IMREAD_GRAYSCALE)
+        
+        # JPEG alters pixel values across the entire image.
+        # Therefore, the ground truth tamper mask is 100% True.
+        gt_mask = np.ones(img.shape, dtype=bool)
+        return tampered, gt_mask

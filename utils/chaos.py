@@ -40,3 +40,10 @@ class SecureChaos:
         Phi = rng.standard_normal((num_measurements, 63))
         Q, _ = np.linalg.qr(Phi.T)
         return Q.T
+    
+    def generate_binary_mask(self, shape) -> np.ndarray:
+        """Generates a spatial chaotic mask to defeat Copy-Move attacks."""
+        length = shape[0] * shape[1]
+        seq = self.logistic_map_sequence(length)
+        # Convert chaotic floats into binary 0 or 1
+        return (seq > 0.5).astype(np.uint8).reshape(shape)

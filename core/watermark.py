@@ -13,11 +13,7 @@ class CompressiveWatermark:
         self.bs = config.BLOCK_SIZE
         self.crypto = SecureChaos(password)
 
-    def _calc_parity(self, array):
-        parity = np.zeros_like(array, dtype=np.uint8)
-        for i in range(3, 8):
-            parity ^= ((array >> i) & 1)
-        return parity
+  
 
     def _allocate(self, img, total_blocks):
         # Calculates block variances and allocates CS budget
@@ -37,6 +33,15 @@ class CompressiveWatermark:
 
         factor = (total_blocks * config.TARGET_AVG_MEASUREMENTS) / np.sum(allocations)
         return np.round(allocations * factor).astype(int)
+    
+
+
+    def _calc_parity(self, array):
+        parity = np.zeros_like(array, dtype=np.uint8)
+        # Use top 7 bits (bits 1-7) to allow for 50+ dB PSNR
+        for i in range(1, 8):
+            parity ^= ((array >> i) & 1)
+        return parity
 
     def embed(self, img):
         h, w = img.shape
@@ -61,13 +66,18 @@ class CompressiveWatermark:
                 cs_payloads.append({'dc': dc, 'ac': y_ac})
                 block_idx += 1
 
-        # SECURE CHAOTIC PERMUTATION
         P = self.crypto.generate_permutation(total_blocks)
         distributed_payloads = [cs_payloads[P[i]] for i in range(total_blocks)]
 
-        # AUTHENTICATION
-        top5 = img & 0xF8
-        watermarked = top5 | self._calc_parity(top5)
+        # ── QUALITY & SECURITY FIX ──
+        # 1. Use 0xFE to only modify the 1st LSB (Achieves 51+ dB PSNR)
+        top7 = img & 0xFE
+        
+        # 2. XOR with Spatial Mask to defeat Copy-Move
+        chaotic_mask = self.crypto.generate_binary_mask((h, w))
+        auth_bit = self._calc_parity(top7) ^ chaotic_mask
+        
+        watermarked = top7 | auth_bit
         
         return watermarked, distributed_payloads, P, allocations
 
@@ -76,26 +86,35 @@ class CompressiveWatermark:
         recovered_img = tampered_img.copy().astype(np.float32)
         P_inv = np.argsort(P)
 
-        # 1. SMART TAMPER DETECTION
-        top5 = tampered_img & 0xF8
-        expected_auth = self._calc_parity(top5)
-        raw_tamper_map = (expected_auth != (tampered_img & 1))
+        # ── 1. SPATIALLY AWARE CRYPTOGRAPHIC TAMPER DETECTION ──
+        top7 = tampered_img & 0xFE
+        chaotic_mask = self.crypto.generate_binary_mask((h, w))
         
-        pixel_tamper_map = np.zeros((h, w), dtype=bool)
-        for i in range(0, h, self.bs):
-            for j in range(0, w, self.bs):
-                block_mask = raw_tamper_map[i:i+self.bs, j:j+self.bs]
-                if np.sum(block_mask) > config.SOLID_ATTACK_THRESHOLD:
-                    pixel_tamper_map[i:i+self.bs, j:j+self.bs] = True
-                elif np.sum(block_mask) > 0:
-                    pixel_tamper_map[i:i+self.bs, j:j+self.bs] = block_mask
+        # XORing with the chaotic mask catches displaced Copy-Move patches!
+        expected_auth = self._calc_parity(top7) ^ chaotic_mask
+        actual_auth = tampered_img & 1
+        
+        # Raw map (Has a 50% false-negative rate on tampered pixels)
+        raw_tamper_map = (expected_auth != actual_auth).astype(np.uint8)
+        
+        # ── 2. IEEE FIX: MORPHOLOGICAL MASK SOLIDIFICATION ──
+        # Close bridges the 50% gaps for solid attacks (Crop/Copy-Move)
+        kernel_close = np.ones((5, 5), np.uint8)
+        solid_tamper_map = cv2.morphologyEx(raw_tamper_map, cv2.MORPH_CLOSE, kernel_close)
+        
+        # Dilate slightly to ensure we swallow the S&P pixels that accidentally passed parity
+        kernel_sp = np.ones((3, 3), np.uint8)
+        dilated_map = cv2.dilate(solid_tamper_map, kernel_sp, iterations=1)
+        
+        pixel_tamper_map = dilated_map.astype(bool)
 
-        # 2. OMP RECOVERY
+        # ── 3. OMP RECOVERY ──
         block_idx = 0
         for i in range(0, h, self.bs):
             for j in range(0, w, self.bs):
-                block_mask = pixel_tamper_map[i:i+self.bs, j:j+self.bs]
-                if np.any(block_mask):
+                block_tamper_mask = pixel_tamper_map[i:i+self.bs, j:j+self.bs]
+
+                if np.any(block_tamper_mask):
                     idx = P_inv[block_idx]
                     payload = payloads[idx]
                     num_meas = allocations[block_idx]
@@ -115,17 +134,27 @@ class CompressiveWatermark:
                     dct_vec[1:] = ac_rec
                     pixel_block = np.clip(idctn(dct_vec.reshape(self.bs, self.bs), norm='ortho'), 0, 255)
 
-                    orig = recovered_img[i:i+self.bs, j:j+self.bs]
-                    mask_float = block_mask.astype(np.float32)
-                    recovered_img[i:i+self.bs, j:j+self.bs] = (mask_float * pixel_block + (1 - mask_float) * orig)
+                    # ── FIX: Per-pixel blending ──
+                    pixel_mask = block_tamper_mask.astype(np.float32)   
+                    original_block = recovered_img[i:i+self.bs, j:j+self.bs]
+                    blended = (pixel_mask * pixel_block + (1.0 - pixel_mask) * original_block)
+                    recovered_img[i:i+self.bs, j:j+self.bs] = blended
                 block_idx += 1
 
-        # 3. GAUSSIAN FEATHERING
         recovered_img = np.clip(recovered_img, 0, 255).astype(np.uint8)
-        dilated = binary_dilation(pixel_tamper_map, structure=np.ones((9, 9), dtype=bool))
-        ring = dilated & ~pixel_tamper_map
-        if ring.any():
+
+        # ── FIX: Gaussian feather on boundary ring ──
+        ring_kernel = np.ones((9, 9), dtype=bool)
+        dilated_boundary = binary_dilation(pixel_tamper_map, structure=ring_kernel)
+        boundary_ring = dilated_boundary & ~pixel_tamper_map         
+
+        if boundary_ring.any():
             blurred = cv2.GaussianBlur(recovered_img, (7, 7), 2)
-            recovered_img[ring] = (0.5 * blurred[ring] + 0.5 * recovered_img[ring]).astype(np.uint8)
+            alpha = 0.5
+            recovered_img[boundary_ring] = (
+                alpha * blurred[boundary_ring].astype(np.float32) + 
+                (1.0 - alpha) * recovered_img[boundary_ring].astype(np.float32)
+            ).astype(np.uint8)
 
         return recovered_img, pixel_tamper_map
+
