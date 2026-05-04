@@ -12,15 +12,14 @@ class CompressiveWatermark:
         self.crypto = SecureChaos(password)
         
         # --- ECZM: ZIGZAG DETERMINISTIC ANCHORS ---
-        # Instead of random OMP, we perfectly capture the top 10 structural edges
         # Standard 8x8 DCT Zigzag Indices: 1, 8, 16, 9, 2, 3, 10, 17, 24, 32
         self.zigzag_idx = [1, 8, 16, 9, 2, 3, 10, 17, 24, 32]
-        
-        # Optimized bit allocations (total exactly 48 bits)
         self.bit_allocs = [6, 6, 5, 5, 5, 5, 4, 4, 4, 4] 
 
     def _calc_parity(self, array):
         parity = np.zeros_like(array, dtype=np.uint8)
+        # BUG 3 FIX: Loop from bit 1 to 7. Bit 0 is intentionally skipped 
+        # because it will ultimately store the parity payload itself.
         for i in range(1, 8):
             parity ^= ((array >> i) & 1)
         return parity
@@ -44,9 +43,11 @@ class CompressiveWatermark:
                 # Dynamic Scale Factor
                 max_ac = np.max(np.abs(acs)) if np.max(np.abs(acs)) > 0 else 1.0
                 max_q = int(np.clip(max_ac / 4.0, 0, 255))
-                max_val_rec = max_q * 4.0 if max_q > 0 else 1.0
                 
-                # Quantize the top 10 frequencies deterministically
+                # BUG 2 FIX: Add 0.5 to max_q to halve the quantization error cliff
+                # We use this midpoint for both encoding and decoding to minimize MSE
+                max_val_rec = (max_q + 0.5) * 4.0 if max_q > 0 else 1.0
+                
                 b_acs = ""
                 for ac, bits in zip(acs, self.bit_allocs):
                     norm = np.clip(ac / max_val_rec, -1.0, 1.0)
@@ -54,27 +55,30 @@ class CompressiveWatermark:
                     q_val = int(np.clip(np.round((norm + 1.0) * (levels / 2.0)), 0, levels))
                     b_acs += format(q_val, f'0{bits}b')
                 
-                # Bit-Pack exactly 64 Bits: DC(8) + Scale(8) + ACs(48)
+                # Bit-Pack exactly 64 Bits
                 bit_string = format(dc, '08b') + format(max_q, '08b') + b_acs
                 payloads[block_idx] = np.array([int(b) for b in bit_string], dtype=np.uint8)
                 block_idx += 1
 
         P = self.crypto.generate_permutation(total_blocks)
+        
+        # BUG 1 FIX: Precompute the inverse permutation to eliminate the O(n^2) bottleneck
+        # argsort() mathematically yields the exact inverse mapping for a permutation array.
+        P_inv = np.argsort(P)
+        
         watermarked = img.copy()
         block_idx = 0
         
-        # --- 2. SINGLE-LSB EMBEDDING (W-PSNR > 44 dB) ---
+        # --- 2. SINGLE-LSB EMBEDDING ---
         for i in range(0, h, self.bs):
             for j in range(0, w, self.bs):
-                source_idx = np.where(P == block_idx)[0][0]
+                source_idx = P_inv[block_idx] # O(1) Instant lookup
                 bits = payloads[source_idx].reshape(self.bs, self.bs)
                 target = watermarked[i:i+self.bs, j:j+self.bs]
                 
-                # Store strictly in the 2nd LSB to maintain visual perfection
                 watermarked[i:i+self.bs, j:j+self.bs] = (target & 0xFD) | (bits << 1)
                 block_idx += 1
 
-        # 1st LSB for chaotic parity authentication
         top7 = watermarked & 0xFE
         chaotic_mask = self.crypto.generate_binary_mask((h, w))
         return top7 | (self._calc_parity(top7) ^ chaotic_mask)
@@ -115,14 +119,14 @@ class CompressiveWatermark:
                     ty, tx = (target_idx // (w // self.bs)) * self.bs, (target_idx % (w // self.bs)) * self.bs
                     
                     if pixel_tamper_map[ty:ty+self.bs, tx:tx+self.bs].any():
-                        lost_mask[i:i+self.bs, j:j+self.bs] = 255 # Payload physically destroyed
+                        lost_mask[i:i+self.bs, j:j+self.bs] = 255 # Payload destroyed
                     else:
-                        # Decode perfectly structured 64-bit stream
                         bits = "".join(extracted_payloads[target_idx].astype(str))
                         dc_val = int(bits[0:8], 2)
                         max_q = int(bits[8:16], 2)
                         
-                        max_val_rec = max_q * 4.0 if max_q > 0 else 1.0
+                        # BUG 2 FIX: Add 0.5 to max_q to halve the quantization error cliff
+                        max_val_rec = (max_q + 0.5) * 4.0 if max_q > 0 else 1.0
                         
                         dct_vec = np.zeros(64)
                         dct_vec[0] = dc_val * 8.0
@@ -144,12 +148,9 @@ class CompressiveWatermark:
 
         recovered_img = np.clip(recovered_img, 0, 255).astype(np.uint8)
 
-        # --- 4. HIERARCHICAL REPAIR (NO BLURRING FILTERS) ---
-        # Seamlessly synthesizes missing textures for strictly destroyed payload blocks
+        # --- 4. HIERARCHICAL REPAIR ---
+        # Using TELEA strictly for blocks where the payload was mechanically destroyed.
         if lost_mask.any():
             recovered_img = cv2.inpaint(recovered_img, lost_mask, 3, cv2.INPAINT_TELEA)
-
-        # We intentionally removed the bilateral and boundary filters here. 
-        # The raw inverse DCT is mathematically sharp. Post-processing ruins the crisp edges.
 
         return recovered_img, pixel_tamper_map

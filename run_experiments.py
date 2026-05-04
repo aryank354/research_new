@@ -31,7 +31,6 @@ def main():
     }
 
     for img_path in image_paths:
-        # File parsing cleanup
         base_name = os.path.splitext(os.path.basename(img_path))[0]
         print(f"Processing Image: {base_name}")
         
@@ -39,7 +38,6 @@ def main():
         if original is None: continue
         original = cv2.resize(original, (256, 256))
 
-        # TRUE SELF-RECOVERY: Payload is embedded entirely inside the image
         watermarked = system.embed(original)
         psnr_w = calc_psnr(original, watermarked)
         ssim_w = calc_ssim(original, watermarked)
@@ -52,7 +50,6 @@ def main():
             ssim_r = calc_ssim(original, recovered)
             nc_r = calc_nc(original, recovered)
             
-            # EVALUATION FIX: JPEG is a global attack, Pixel-level TPR/FPR is undefined
             if "JPEG" in attack_name:
                 tpr, fpr, f1 = np.nan, np.nan, np.nan
             else:
@@ -99,14 +96,12 @@ def main():
     print("EXPERIMENTS COMPLETE. AVERAGE RESULTS ACROSS ALL IMAGES:")
     print("="*60)
     
-    # Clean and explicit Pandas aggregation calculation
     metric_cols = ["W-PSNR", "W-SSIM", "R-PSNR", "R-SSIM", "R-NC", "TPR", "FPR", "F1-Score"]
     df_summary = df.copy()
     
-    # Replace the strings and explicitly cast ONLY the numerical columns to float
-    df_summary[metric_cols] = df_summary[metric_cols].replace("N/A", np.nan).astype(float)
+    # BUG 6 FIX: Using errors='coerce' to safely map mixed types into np.nan
+    df_summary[metric_cols] = df_summary[metric_cols].replace("N/A", np.nan).apply(pd.to_numeric, errors='coerce')
     
-    # Group by attack and calculate mean
     summary = df_summary.groupby("Attack")[metric_cols].mean().round(4)
     print(summary)
 
