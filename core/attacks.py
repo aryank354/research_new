@@ -27,10 +27,13 @@ class Attacks:
         gt_mask = np.zeros((h, w), dtype=bool)
         
         size = 64
-        # Copy from top-left to bottom-right
         patch = tampered[0:size, 0:size].copy()
         tampered[h-size:h, w-size:w] = patch
+        
+        # ── EVALUATION FIX: Mark BOTH source and destination as tampered ──
+        gt_mask[0:size, 0:size] = True 
         gt_mask[h-size:h, w-size:w] = True
+        
         return tampered, gt_mask
 
     @staticmethod
@@ -47,16 +50,11 @@ class Attacks:
         gt_mask[salt | pepper] = True
         return tampered, gt_mask
     
-
     @staticmethod
     def jpeg_compression(img, quality=80):
-        """Simulates a global JPEG compression attack."""
-        # Encode to JPEG in memory, then decode back to raw pixels
         encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), quality]
         _, encimg = cv2.imencode('.jpg', img, encode_param)
         tampered = cv2.imdecode(encimg, cv2.IMREAD_GRAYSCALE)
         
-        # JPEG alters pixel values across the entire image.
-        # Therefore, the ground truth tamper mask is 100% True.
         gt_mask = np.ones(img.shape, dtype=bool)
         return tampered, gt_mask

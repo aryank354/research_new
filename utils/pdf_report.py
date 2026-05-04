@@ -41,6 +41,12 @@ def build_visual_pdf(results: list, output_path: str):
     def make_img(path):
         return RLImage(path, width=IMG_W, height=IMG_H, kind='proportional')
 
+    # Helper function to safely format metrics (allows for "N/A" strings)
+    def format_metric(val):
+        if isinstance(val, str):
+            return val
+        return f"{val:.4f}"
+
     for idx, r in enumerate(results):
         story.append(Paragraph(f"Experiment {idx+1}: {r['Image']} — Attack: {r['Attack']}", section_style))
         
@@ -67,8 +73,8 @@ def build_visual_pdf(results: list, output_path: str):
             ["Metric", "Value", "Metric", "Value"],
             ["Watermarked PSNR", f"{r['W-PSNR']:.2f} dB", "Recovered PSNR", f"{r['R-PSNR']:.2f} dB"],
             ["Watermarked SSIM", f"{r['W-SSIM']:.4f}", "Recovered SSIM", f"{r['R-SSIM']:.4f}"],
-            ["True Positive Rate (TPR)", f"{r['TPR']:.4f}", "Recovered NC", f"{r['R-NC']:.4f}"],
-            ["False Positive Rate (FPR)", f"{r['FPR']:.4f}", "Tamper F1-Score", f"{r['F1-Score']:.4f}"]
+            ["True Positive Rate (TPR)", format_metric(r['TPR']), "Recovered NC", format_metric(r['R-NC'])],
+            ["False Positive Rate (FPR)", format_metric(r['FPR']), "Tamper F1-Score", format_metric(r['F1-Score'])]
         ]
         
         m_table = Table(metrics_data, colWidths=[4.5*cm, 3.5*cm, 4.5*cm, 3.5*cm])

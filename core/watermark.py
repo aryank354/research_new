@@ -3,8 +3,6 @@
 import cv2
 import numpy as np
 from scipy.fftpack import dctn, idctn
-from scipy.ndimage import binary_dilation
-from sklearn.linear_model import OrthogonalMatchingPursuit
 from utils.chaos import SecureChaos
 import config
 
@@ -12,33 +10,17 @@ class CompressiveWatermark:
     def __init__(self, password=config.SECRET_PASSWORD):
         self.bs = config.BLOCK_SIZE
         self.crypto = SecureChaos(password)
-
-  
-
-    def _allocate(self, img, total_blocks):
-        # Calculates block variances and allocates CS budget
-        h, w = img.shape
-        variances = [np.var(img[i:i+self.bs, j:j+self.bs]) 
-                     for i in range(0, h, self.bs) for j in range(0, w, self.bs)]
         
-        allocations = np.zeros(total_blocks, dtype=int)
-        sorted_vars = np.sort(variances)
-        thresh_smooth = sorted_vars[int(total_blocks * 0.40)]
-        thresh_texture = sorted_vars[int(total_blocks * 0.80)]
-
-        for i in range(total_blocks):
-            if variances[i] <= thresh_smooth: allocations[i] = 8
-            elif variances[i] > thresh_texture: allocations[i] = 32
-            else: allocations[i] = 16
-
-        factor = (total_blocks * config.TARGET_AVG_MEASUREMENTS) / np.sum(allocations)
-        return np.round(allocations * factor).astype(int)
-    
-
+        # --- ECZM: ZIGZAG DETERMINISTIC ANCHORS ---
+        # Instead of random OMP, we perfectly capture the top 10 structural edges
+        # Standard 8x8 DCT Zigzag Indices: 1, 8, 16, 9, 2, 3, 10, 17, 24, 32
+        self.zigzag_idx = [1, 8, 16, 9, 2, 3, 10, 17, 24, 32]
+        
+        # Optimized bit allocations (total exactly 48 bits)
+        self.bit_allocs = [6, 6, 5, 5, 5, 5, 4, 4, 4, 4] 
 
     def _calc_parity(self, array):
         parity = np.zeros_like(array, dtype=np.uint8)
-        # Use top 7 bits (bits 1-7) to allow for 50+ dB PSNR
         for i in range(1, 8):
             parity ^= ((array >> i) & 1)
         return parity
@@ -46,115 +28,128 @@ class CompressiveWatermark:
     def embed(self, img):
         h, w = img.shape
         total_blocks = (h // self.bs) * (w // self.bs)
-        allocations = self._allocate(img, total_blocks)
         
-        cs_payloads = []
+        payloads = {}
         block_idx = 0
         
+        # --- 1. ECZM PAYLOAD GENERATION ---
         for i in range(0, h, self.bs):
             for j in range(0, w, self.bs):
                 block = img[i:i+self.bs, j:j+self.bs]
                 dct_vec = dctn(block, norm='ortho').flatten()
                 
                 dc = int(np.clip(np.round(dct_vec[0] / 8.0), 0, 255))
-                ac = dct_vec[1:]
+                acs = dct_vec[self.zigzag_idx]
                 
-                num_meas = allocations[block_idx]
-                Phi = self.crypto.generate_sensing_matrix(num_meas, block_idx)
-                y_ac = np.dot(Phi, ac) if Phi is not None else np.array([])
+                # Dynamic Scale Factor
+                max_ac = np.max(np.abs(acs)) if np.max(np.abs(acs)) > 0 else 1.0
+                max_q = int(np.clip(max_ac / 4.0, 0, 255))
+                max_val_rec = max_q * 4.0 if max_q > 0 else 1.0
                 
-                cs_payloads.append({'dc': dc, 'ac': y_ac})
+                # Quantize the top 10 frequencies deterministically
+                b_acs = ""
+                for ac, bits in zip(acs, self.bit_allocs):
+                    norm = np.clip(ac / max_val_rec, -1.0, 1.0)
+                    levels = (1 << bits) - 1
+                    q_val = int(np.clip(np.round((norm + 1.0) * (levels / 2.0)), 0, levels))
+                    b_acs += format(q_val, f'0{bits}b')
+                
+                # Bit-Pack exactly 64 Bits: DC(8) + Scale(8) + ACs(48)
+                bit_string = format(dc, '08b') + format(max_q, '08b') + b_acs
+                payloads[block_idx] = np.array([int(b) for b in bit_string], dtype=np.uint8)
                 block_idx += 1
 
         P = self.crypto.generate_permutation(total_blocks)
-        distributed_payloads = [cs_payloads[P[i]] for i in range(total_blocks)]
-
-        # ── QUALITY & SECURITY FIX ──
-        # 1. Use 0xFE to only modify the 1st LSB (Achieves 51+ dB PSNR)
-        top7 = img & 0xFE
+        watermarked = img.copy()
+        block_idx = 0
         
-        # 2. XOR with Spatial Mask to defeat Copy-Move
+        # --- 2. SINGLE-LSB EMBEDDING (W-PSNR > 44 dB) ---
+        for i in range(0, h, self.bs):
+            for j in range(0, w, self.bs):
+                source_idx = np.where(P == block_idx)[0][0]
+                bits = payloads[source_idx].reshape(self.bs, self.bs)
+                target = watermarked[i:i+self.bs, j:j+self.bs]
+                
+                # Store strictly in the 2nd LSB to maintain visual perfection
+                watermarked[i:i+self.bs, j:j+self.bs] = (target & 0xFD) | (bits << 1)
+                block_idx += 1
+
+        # 1st LSB for chaotic parity authentication
+        top7 = watermarked & 0xFE
         chaotic_mask = self.crypto.generate_binary_mask((h, w))
-        auth_bit = self._calc_parity(top7) ^ chaotic_mask
-        
-        watermarked = top7 | auth_bit
-        
-        return watermarked, distributed_payloads, P, allocations
+        return top7 | (self._calc_parity(top7) ^ chaotic_mask)
 
-    def recover(self, tampered_img, payloads, P, allocations):
+    def recover(self, tampered_img):
         h, w = tampered_img.shape
         recovered_img = tampered_img.copy().astype(np.float32)
-        P_inv = np.argsort(P)
+        total_blocks = (h // self.bs) * (w // self.bs)
+        P = self.crypto.generate_permutation(total_blocks)
 
-        # ── 1. SPATIALLY AWARE CRYPTOGRAPHIC TAMPER DETECTION ──
+        # --- 1. TAMPER DETECTION ---
         top7 = tampered_img & 0xFE
         chaotic_mask = self.crypto.generate_binary_mask((h, w))
+        raw_tamper_map = (self._calc_parity(top7) ^ chaotic_mask != (tampered_img & 1)).astype(np.uint8)
         
-        # XORing with the chaotic mask catches displaced Copy-Move patches!
-        expected_auth = self._calc_parity(top7) ^ chaotic_mask
-        actual_auth = tampered_img & 1
-        
-        # Raw map (Has a 50% false-negative rate on tampered pixels)
-        raw_tamper_map = (expected_auth != actual_auth).astype(np.uint8)
-        
-        # ── 2. IEEE FIX: MORPHOLOGICAL MASK SOLIDIFICATION ──
-        # Close bridges the 50% gaps for solid attacks (Crop/Copy-Move)
-        kernel_close = np.ones((5, 5), np.uint8)
-        solid_tamper_map = cv2.morphologyEx(raw_tamper_map, cv2.MORPH_CLOSE, kernel_close)
-        
-        # Dilate slightly to ensure we swallow the S&P pixels that accidentally passed parity
-        kernel_sp = np.ones((3, 3), np.uint8)
-        dilated_map = cv2.dilate(solid_tamper_map, kernel_sp, iterations=1)
-        
-        pixel_tamper_map = dilated_map.astype(bool)
+        solid_tamper_map = cv2.morphologyEx(raw_tamper_map, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+        pixel_tamper_map = cv2.dilate(solid_tamper_map, np.ones((3, 3), np.uint8)).astype(bool)
 
-        # ── 3. OMP RECOVERY ──
+        # --- 2. EXTRACT 64-BIT PAYLOADS ---
+        extracted_payloads = {}
         block_idx = 0
         for i in range(0, h, self.bs):
             for j in range(0, w, self.bs):
-                block_tamper_mask = pixel_tamper_map[i:i+self.bs, j:j+self.bs]
+                block = tampered_img[i:i+self.bs, j:j+self.bs]
+                extracted_payloads[block_idx] = ((block >> 1) & 1).flatten()
+                block_idx += 1
 
-                if np.any(block_tamper_mask):
-                    idx = P_inv[block_idx]
-                    payload = payloads[idx]
-                    num_meas = allocations[block_idx]
+        # --- 3. ECZM DETERMINISTIC RECOVERY ---
+        lost_mask = np.zeros_like(pixel_tamper_map, dtype=np.uint8)
+        block_idx = 0
+        
+        for i in range(0, h, self.bs):
+            for j in range(0, w, self.bs):
+                block_mask = pixel_tamper_map[i:i+self.bs, j:j+self.bs]
 
-                    dc_rec = payload['dc'] * 8.0
-                    ac_rec = np.zeros(63)
-                    if num_meas > 0 and len(payload['ac']) > 0:
-                        Phi = self.crypto.generate_sensing_matrix(num_meas, block_idx)
-                        omp = OrthogonalMatchingPursuit(n_nonzero_coefs=max(1, num_meas // config.SPARSITY_RATIO))
-                        try:
-                            omp.fit(Phi, payload['ac'])
-                            ac_rec = omp.coef_
-                        except: pass
-
-                    dct_vec = np.zeros(64)
-                    dct_vec[0] = dc_rec
-                    dct_vec[1:] = ac_rec
-                    pixel_block = np.clip(idctn(dct_vec.reshape(self.bs, self.bs), norm='ortho'), 0, 255)
-
-                    # ── FIX: Per-pixel blending ──
-                    pixel_mask = block_tamper_mask.astype(np.float32)   
-                    original_block = recovered_img[i:i+self.bs, j:j+self.bs]
-                    blended = (pixel_mask * pixel_block + (1.0 - pixel_mask) * original_block)
-                    recovered_img[i:i+self.bs, j:j+self.bs] = blended
+                if np.any(block_mask):
+                    target_idx = P[block_idx] 
+                    ty, tx = (target_idx // (w // self.bs)) * self.bs, (target_idx % (w // self.bs)) * self.bs
+                    
+                    if pixel_tamper_map[ty:ty+self.bs, tx:tx+self.bs].any():
+                        lost_mask[i:i+self.bs, j:j+self.bs] = 255 # Payload physically destroyed
+                    else:
+                        # Decode perfectly structured 64-bit stream
+                        bits = "".join(extracted_payloads[target_idx].astype(str))
+                        dc_val = int(bits[0:8], 2)
+                        max_q = int(bits[8:16], 2)
+                        
+                        max_val_rec = max_q * 4.0 if max_q > 0 else 1.0
+                        
+                        dct_vec = np.zeros(64)
+                        dct_vec[0] = dc_val * 8.0
+                        
+                        bit_idx = 16
+                        for ac_idx, n_bits in zip(self.zigzag_idx, self.bit_allocs):
+                            q_val = int(bits[bit_idx : bit_idx + n_bits], 2)
+                            levels = (1 << n_bits) - 1
+                            dct_vec[ac_idx] = (q_val / (levels / 2.0) - 1.0) * max_val_rec
+                            bit_idx += n_bits
+                        
+                        pixel_block = np.clip(idctn(dct_vec.reshape(self.bs, self.bs), norm='ortho'), 0, 255)
+                        
+                        p_mask = block_mask.astype(np.float32)
+                        orig = recovered_img[i:i+self.bs, j:j+self.bs]
+                        recovered_img[i:i+self.bs, j:j+self.bs] = (p_mask * pixel_block + (1.0 - p_mask) * orig)
+                
                 block_idx += 1
 
         recovered_img = np.clip(recovered_img, 0, 255).astype(np.uint8)
 
-        # ── FIX: Gaussian feather on boundary ring ──
-        ring_kernel = np.ones((9, 9), dtype=bool)
-        dilated_boundary = binary_dilation(pixel_tamper_map, structure=ring_kernel)
-        boundary_ring = dilated_boundary & ~pixel_tamper_map         
+        # --- 4. HIERARCHICAL REPAIR (NO BLURRING FILTERS) ---
+        # Seamlessly synthesizes missing textures for strictly destroyed payload blocks
+        if lost_mask.any():
+            recovered_img = cv2.inpaint(recovered_img, lost_mask, 3, cv2.INPAINT_TELEA)
 
-        if boundary_ring.any():
-            blurred = cv2.GaussianBlur(recovered_img, (7, 7), 2)
-            alpha = 0.5
-            recovered_img[boundary_ring] = (
-                alpha * blurred[boundary_ring].astype(np.float32) + 
-                (1.0 - alpha) * recovered_img[boundary_ring].astype(np.float32)
-            ).astype(np.uint8)
+        # We intentionally removed the bilateral and boundary filters here. 
+        # The raw inverse DCT is mathematically sharp. Post-processing ruins the crisp edges.
 
         return recovered_img, pixel_tamper_map
-

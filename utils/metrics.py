@@ -12,8 +12,13 @@ def calc_ssim(img1, img2):
     return ssim(img1, img2, data_range=255)
 
 def calc_nc(img1, img2):
-    """Normalized Correlation: Measures structural preservation."""
-    img1, img2 = img1.astype(float), img2.astype(float)
+    """
+    Zero-Mean Normalized Cross-Correlation (ZNCC).
+    Subtracting the mean aligns with standard literature definitions.
+    """
+    img1 = img1.astype(float) - np.mean(img1)
+    img2 = img2.astype(float) - np.mean(img2)
+    
     numerator = np.sum(img1 * img2)
     denominator = np.sqrt(np.sum(img1**2) * np.sum(img2**2))
     return numerator / (denominator + 1e-10)

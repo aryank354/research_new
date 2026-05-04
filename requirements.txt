@@ -1,1 +1,7 @@
+numpy
+opencv-python
+scipy
+scikit-learn
+scikit-image
+reportlab
 pandas
